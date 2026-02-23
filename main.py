@@ -13,6 +13,7 @@ Ring Deduction - Apex Legends 缩圈预测工具
     python main.py              # 正常运行
     python main.py --rebuild    # 强制重建参考图缓存
     python main.py --no-debug   # 关闭调试可视化
+    python main.py --constant   # 持续监控模式，新截图出现时自动处理
 """
 
 import cv2
@@ -594,45 +595,22 @@ def save_comparison(map_img, sc_circle, best_name, cache):
 
 # ======================== 主流程 ========================
 
-def main():
+def process_screenshot(ss_path, cache):
+    """
+    处理单张截图：裁剪 -> 匹配 -> 显示结果 -> 打开最佳匹配。
+    返回 (best_name, score) 或 None。
+    """
     t0 = time.time()
-    force_rebuild = "--rebuild" in sys.argv
-    global DEBUG
-    if "--no-debug" in sys.argv:
-        DEBUG = False
-
-    # 0. 验证地图配置
-    log(f"当前地图: {MAP_NAME}")
-    if MAP_NAME not in AVAILABLE_MAPS:
-        log(f"未知地图 '{MAP_NAME}'，可用: {', '.join(AVAILABLE_MAPS)}", "WARN")
-    if not MAP_DIR.exists():
-        log(f"地图目录不存在: {MAP_DIR}", "ERROR")
-        sys.exit(1)
-
-    # 1. 最新截图（或指定文件）
-    if "--file" in sys.argv:
-        idx = sys.argv.index("--file") + 1
-        if idx < len(sys.argv):
-            ss_path = Path(sys.argv[idx])
-            log(f"指定截图: {ss_path.name}")
-        else:
-            log("--file 需要指定文件路径", "ERROR"); sys.exit(1)
-    else:
-        ss_path = get_latest_screenshot()
     ss_img = imread_safe(ss_path)
     if ss_img is None:
-        log(f"无法读取: {ss_path}", "ERROR"); sys.exit(1)
+        log(f"无法读取: {ss_path}", "ERROR")
+        return None
     log(f"截图尺寸: {ss_img.shape[1]}×{ss_img.shape[0]}")
 
-    # 2. 裁剪地图
+    # 裁剪地图
     map_img = crop_map_from_screenshot(ss_img)
 
-    # 3. 加载缓存
-    cache = load_cache(force_rebuild)
-    if not cache:
-        log("缓存为空", "ERROR"); sys.exit(1)
-
-    # 4. 叠加匹配（主方法：直接比较白色环线与参考圈的吻合度）
+    # 叠加匹配
     results = match_by_overlay(map_img, cache)
 
     if not results:
@@ -640,7 +618,7 @@ def main():
         det = detect_ring_screenshot(map_img)
         if det is None:
             log("无法检测到缩圈。请确认截图是地图界面。", "ERROR")
-            sys.exit(1)
+            return None
         ring_det, _ = det
         results = match_ring(ring_det, map_img.shape, cache)
 
@@ -658,7 +636,7 @@ def main():
         save_debug(map_img, ring, filename="detected_ring.jpg")
         save_comparison(map_img, ring, best_name, cache)
 
-    # 5. 显示结果
+    # 显示结果
     print()
     print("=" * 58)
     print(f"  {'#':<4} {'文件名':<20} {'得分':<10} {'圆心':<18} {'半径'}")
@@ -669,11 +647,99 @@ def main():
               f"({d['cx_n']:.3f},{d['cy_n']:.3f})     {d['r_n']:.3f}")
     print("=" * 58)
 
-    # 6. 打开
+    # 打开
     log(f"最佳匹配: {best_name} (得分: {results[0][1]:.4f})")
     os.startfile(str((MAP_DIR / best_name).resolve()))
     log(f"已打开 {best_name}")
     log(f"耗时: {time.time()-t0:.1f}s")
+    return best_name, results[0][1]
+
+
+def watch_mode(cache, poll_interval=0.5):
+    """
+    持续监控模式：监视 screenshot 目录，
+    当检测到新截图时立即处理。
+    按 Ctrl+C 退出。
+    """
+    exts = {'.png', '.jpg', '.jpeg', '.bmp'}
+    log(f"持续监控模式已启动，监视目录: {SCREENSHOT_DIR}")
+    log("等待新截图... (Ctrl+C 退出)")
+    print()
+
+    # 记录当前已有文件及其修改时间
+    known = {}
+    if SCREENSHOT_DIR.exists():
+        for f in SCREENSHOT_DIR.iterdir():
+            if f.suffix.lower() in exts:
+                known[f.name] = f.stat().st_mtime
+
+    try:
+        while True:
+            time.sleep(poll_interval)
+            if not SCREENSHOT_DIR.exists():
+                continue
+
+            for f in SCREENSHOT_DIR.iterdir():
+                if f.suffix.lower() not in exts:
+                    continue
+                mtime = f.stat().st_mtime
+                if f.name not in known or mtime > known[f.name]:
+                    # 等待文件写入完成（避免读到不完整的文件）
+                    prev_size = -1
+                    for _ in range(10):
+                        cur_size = f.stat().st_size
+                        if cur_size == prev_size and cur_size > 0:
+                            break
+                        prev_size = cur_size
+                        time.sleep(0.2)
+
+                    known[f.name] = mtime
+                    log(f"检测到新截图: {f.name}")
+                    print("─" * 58)
+                    process_screenshot(f, cache)
+                    print()
+                    log("等待新截图... (Ctrl+C 退出)")
+    except KeyboardInterrupt:
+        print()
+        log("监控模式已退出")
+
+
+def main():
+    force_rebuild = "--rebuild" in sys.argv
+    global DEBUG
+    if "--no-debug" in sys.argv:
+        DEBUG = False
+
+    # 0. 验证地图配置
+    log(f"当前地图: {MAP_NAME}")
+    if MAP_NAME not in AVAILABLE_MAPS:
+        log(f"未知地图 '{MAP_NAME}'，可用: {', '.join(AVAILABLE_MAPS)}", "WARN")
+    if not MAP_DIR.exists():
+        log(f"地图目录不存在: {MAP_DIR}", "ERROR")
+        sys.exit(1)
+
+    # 加载缓存
+    cache = load_cache(force_rebuild)
+    if not cache:
+        log("缓存为空", "ERROR"); sys.exit(1)
+
+    # 持续监控模式
+    if "--constant" in sys.argv:
+        watch_mode(cache)
+        return
+
+    # 单次模式：最新截图（或指定文件）
+    if "--file" in sys.argv:
+        idx = sys.argv.index("--file") + 1
+        if idx < len(sys.argv):
+            ss_path = Path(sys.argv[idx])
+            log(f"指定截图: {ss_path.name}")
+        else:
+            log("--file 需要指定文件路径", "ERROR"); sys.exit(1)
+    else:
+        ss_path = get_latest_screenshot()
+
+    process_screenshot(ss_path, cache)
 
 
 if __name__ == "__main__":
