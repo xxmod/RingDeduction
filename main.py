@@ -61,7 +61,7 @@ def imread_safe(filepath):
 
 # 从游戏截图中裁剪地图区域的比例 (left, top, right, bottom)
 # 适用于 16:9 分辨率 (1920×1080 等)
-SCREENSHOT_MAP_CROP = (0.26, 0.02, 0.76, 0.95)
+SCREENSHOT_MAP_CROP = (0.245, 0.035, 0.745, 0.905)
 
 
 def crop_map_from_screenshot(img):
@@ -117,14 +117,78 @@ def _cluster(circles, tol):
     return [(o[0], o[1], o[2]) for o in out]
 
 
-def _ring_brightness_score(gray, cx, cy, r):
+def _detect_crosshair(gray, threshold=170, coverage=0.35):
+    """
+    检测截图中的十字线（鼠标路径标记）。
+    十字线是跨越大半个图像的水平/垂直亮线。
+    返回 (crosshair_rows, crosshair_cols) — 需要遮蔽的行和列索引列表。
+    """
+    h, w = gray.shape
+    rows = []
+    cols = []
+
+    # 检测水平亮线
+    for y in range(h):
+        bright = np.sum(gray[y, :] > threshold)
+        if bright > w * coverage:
+            rows.append(y)
+
+    # 检测垂直亮线
+    for x in range(w):
+        bright = np.sum(gray[:, x] > threshold)
+        if bright > h * coverage:
+            cols.append(x)
+
+    return rows, cols
+
+
+def _mask_crosshair(gray, rows, cols, width=5):
+    """
+    将十字线区域替换为周围像素的中值，消除干扰。
+    """
+    cleaned = gray.copy()
+    h, w = gray.shape
+
+    for y in rows:
+        y_lo = max(0, y - width)
+        y_hi = min(h, y + width + 1)
+        # 用十字线上下方的像素中值填充
+        above = max(0, y - width * 2)
+        below = min(h, y + width * 2 + 1)
+        for x in range(w):
+            neighbors = []
+            if above < y_lo:
+                neighbors.extend(gray[above:y_lo, x].tolist())
+            if y_hi < below:
+                neighbors.extend(gray[y_hi:below, x].tolist())
+            if neighbors:
+                cleaned[y_lo:y_hi, x] = int(np.median(neighbors))
+
+    for x in cols:
+        x_lo = max(0, x - width)
+        x_hi = min(w, x + width + 1)
+        left = max(0, x - width * 2)
+        right = min(w, x + width * 2 + 1)
+        for y in range(h):
+            neighbors = []
+            if left < x_lo:
+                neighbors.extend(gray[y, left:x_lo].tolist())
+            if x_hi < right:
+                neighbors.extend(gray[y, x_hi:right].tolist())
+            if neighbors:
+                cleaned[y, x_lo:x_hi] = int(np.median(neighbors))
+
+    return cleaned
+
+
+def _ring_score(gray, cx, cy, r, crosshair_rows=None, crosshair_cols=None):
     """
     综合评估候选圆是否是真正的缩圈。
     评分维度：
-    1. 圈内外亮度差（缩圈外有灰色蒙版变暗）
-    2. 圈边界白色像素比例（缩圈边线是白色）
-    3. 半径合理性（渐进加分，越大越好，但不能超出范围）
-    4. 圆心居中度（缩圈中心通常在地图中部附近）
+    1. 圈内外亮度差（缩圈外有灰色蒙版变暗，仅正值时生效）
+    2. 圈边界白色像素比例（排除十字线干扰）——最重要的特征
+    3. 半径合理性（轻微加分，不强烈偏好大圈）
+    4. 圆心居中度
     """
     h, w = gray.shape
     ys, xs = np.ogrid[:h, :w]
@@ -133,8 +197,6 @@ def _ring_brightness_score(gray, cx, cy, r):
     # --- 1) 圈内外亮度差 ---
     inner_mask = (dist > r * 0.3) & (dist < r * 0.85)
     outer_mask = (dist > r * 1.1) & (dist < r * 1.6)
-    inner_mask &= (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-    outer_mask &= (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
 
     inner_count = np.sum(inner_mask)
     outer_count = np.sum(outer_mask)
@@ -144,32 +206,51 @@ def _ring_brightness_score(gray, cx, cy, r):
     inner_mean = float(np.mean(gray[inner_mask]))
     outer_mean = float(np.mean(gray[outer_mask]))
     brightness_diff = inner_mean - outer_mean
+    # 仅正亮度差有效（圈内亮于圈外），负值视为0
+    brightness_score = max(0.0, brightness_diff)
 
-    # --- 2) 圈边界附近白色像素比例 ---
+    # --- 2) 圈边界白色像素比例 ---
     ring_mask = (dist > r * 0.93) & (dist < r * 1.07)
-    ring_mask &= (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-    ring_count = np.sum(ring_mask)
-    white_ratio = np.sum(gray[ring_mask] > 200) / ring_count if ring_count > 0 else 0.0
 
-    # --- 3) 半径合理性（渐进，偏好大圈） ---
+    # 排除十字线区域的干扰
+    if crosshair_rows or crosshair_cols:
+        exclude = np.zeros((h, w), dtype=bool)
+        for row_y in (crosshair_rows or []):
+            for dy in range(-5, 6):
+                ry = row_y + dy
+                if 0 <= ry < h:
+                    exclude[ry, :] = True
+        for col_x in (crosshair_cols or []):
+            for dx in range(-5, 6):
+                rx = col_x + dx
+                if 0 <= rx < w:
+                    exclude[:, rx] = True
+        ring_mask = ring_mask & (~exclude)
+
+    ring_count = np.sum(ring_mask)
+    if ring_count > 0:
+        white_ratio = float(np.sum(gray[ring_mask] > 200)) / ring_count
+    else:
+        white_ratio = 0.0
+
+    # --- 3) 半径合理性（轻微加分，不强烈偏好大圈）---
     d_min = min(h, w)
     r_ratio = r / d_min
-    if 0.20 <= r_ratio <= 0.60:
-        # 在合理范围内，越大越好（线性加分）
-        size_bonus = 5.0 + r_ratio * 30.0  # r_ratio=0.35 -> 15.5
+    if 0.20 <= r_ratio <= 0.55:
+        size_bonus = 5.0  # 固定小加分，不随半径增大
+    elif 0.15 <= r_ratio <= 0.62:
+        size_bonus = 2.0
     else:
         size_bonus = -10.0
 
     # --- 4) 圆心居中度 ---
-    # 缩圈中心通常在地图中部，越偏离中心越不可能
     img_cx, img_cy = w / 2, h / 2
     center_dist = np.hypot(cx - img_cx, cy - img_cy)
-    center_dist_ratio = center_dist / np.hypot(img_cx, img_cy)  # 归一化到 [0, 1]
-    # 距中心越近加分越高，最远(角落)时为0
+    center_dist_ratio = center_dist / np.hypot(img_cx, img_cy)
     center_bonus = max(0.0, 8.0 * (1.0 - center_dist_ratio * 2.0))
 
     # --- 综合评分 ---
-    score = brightness_diff + white_ratio * 80.0 + size_bonus + center_bonus
+    score = brightness_score + white_ratio * 100.0 + size_bonus + center_bonus
     return score
 
 
@@ -188,25 +269,34 @@ def detect_ring_screenshot(map_img):
     d = min(h, w)
     min_r = int(d * 0.15)
     max_r = int(d * 0.60)
+
+    # --- 检测并去除十字线干扰 ---
+    ch_rows, ch_cols = _detect_crosshair(gray)
+    if ch_rows or ch_cols:
+        log(f"检测到十字线: {len(ch_rows)}条水平, {len(ch_cols)}条垂直", "DEBUG")
+        gray_clean = _mask_crosshair(gray, ch_rows, ch_cols)
+    else:
+        gray_clean = gray
+
     candidates = []
 
     # 策略1: 重度模糊 + Canny 边缘（圈内外亮度差产生边缘）
     for blur_k in [31, 51, 71]:
-        heavy = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
+        heavy = cv2.GaussianBlur(gray_clean, (blur_k, blur_k), 0)
         edges = cv2.Canny(heavy, 15, 50)
         for dp, p2 in [(1.5, 12), (2.0, 12), (1.2, 15)]:
             candidates.extend(_hough(edges, min_r, max_r, dp, 50, p2))
 
     # 策略2: 白色阈值（缩圈边线是白色）
     for thr in [190, 210, 230]:
-        _, mask = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(gray_clean, thr, 255, cv2.THRESH_BINARY)
         for dp, p2 in [(1.5, 18), (2.0, 15), (1.2, 20)]:
             candidates.extend(_hough(mask, min_r, max_r, dp, 50, p2, blur_k=9))
 
     # 策略3: 标准灰度
     for dp, p1, p2 in [(1.0, 100, 40), (1.2, 100, 40), (1.5, 80, 30),
                         (1.2, 80, 30), (1.0, 60, 25)]:
-        candidates.extend(_hough(gray, min_r, max_r, dp, p1, p2, blur_k=9))
+        candidates.extend(_hough(gray_clean, min_r, max_r, dp, p1, p2, blur_k=9))
 
     if not candidates:
         return None
@@ -234,23 +324,23 @@ def detect_ring_screenshot(map_img):
     if not clusters:
         return None
 
-    # ---- 关键改进：用亮度差评分选择真正的缩圈 ----
-    # 对每个候选簇计算圈内外亮度差，真正的缩圈圈内更亮、圈外更暗
+    # ---- 关键改进：用综合评分选择真正的缩圈 ----
+    # 排除十字线干扰，综合亮度差+白色边线+尺寸+居中度
     scored = []
-    for i, (cx, cy, r) in enumerate(clusters[:15]):  # 评估前15个候选
-        bright_score = _ring_brightness_score(gray, cx, cy, r)
-        scored.append((cx, cy, r, bright_score, i))
+    for i, (cx, cy, r) in enumerate(clusters[:15]):
+        s = _ring_score(gray, cx, cy, r, ch_rows, ch_cols)
+        scored.append((cx, cy, r, s, i))
 
     # 按亮度差评分降序排列
     scored.sort(key=lambda x: x[3], reverse=True)
 
     for i, (cx, cy, r, bs, idx) in enumerate(scored[:5]):
         log(f"  候选#{i+1}: center=({cx:.0f},{cy:.0f}) r={r:.0f} "
-            f"亮度差={bs:.1f} (原簇#{idx+1})", "DEBUG")
+            f"评分={bs:.1f} (原簇#{idx+1})", "DEBUG")
 
     best = scored[0]
-    log(f"选择亮度差最大的圈: center=({best[0]:.0f},{best[1]:.0f}) "
-        f"r={best[2]:.0f} 亮度差={best[3]:.1f}", "DEBUG")
+    log(f"选择评分最高的圈: center=({best[0]:.0f},{best[1]:.0f}) "
+        f"r={best[2]:.0f} 评分={best[3]:.1f}", "DEBUG")
     return (best[0], best[1], best[2]), scored
 
 
@@ -344,6 +434,88 @@ def match_ring(sc_circle, sc_shape, cache):
     return scores[:TOP_N]
 
 
+def match_by_overlay(map_img, cache):
+    """
+    叠加匹配：将缓存中每个参考圈投影到截图上，
+    通过圈内外亮度对比差来找到最佳匹配。
+
+    核心原理：Apex 中缩圈外的区域会有灰暗蒙版叠加，
+    导致圈内区域比圈外区域明显更亮。将参考圈位置投影到截图上，
+    计算"圈内平均亮度 - 圈外平均亮度"，值最大的就是匹配。
+
+    这种方法不依赖 HoughCircles，不需要检测白色环线，
+    而是利用缩圈的核心视觉特征（内外亮度差）来匹配。
+    """
+    gray = cv2.cvtColor(map_img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    d = min(h, w)
+
+    # 十字线处理
+    ch_rows, ch_cols = _detect_crosshair(gray)
+    if ch_rows or ch_cols:
+        log(f"叠加匹配: 检测到十字线 ({len(ch_rows)}H, {len(ch_cols)}V)", "DEBUG")
+        gray = _mask_crosshair(gray, ch_rows, ch_cols)
+
+    # 重度平滑，消除地图纹理/图标/文字的干扰，保留大面积亮度差
+    smooth = cv2.GaussianBlur(gray, (15, 15), 5).astype(np.float32)
+
+    results = []
+    for name, data in cache.items():
+        if "cx_n" not in data:
+            continue
+
+        # 将参考圈归一化坐标映射到截图像素坐标
+        cx = data["cx_n"] * w
+        cy = data["cy_n"] * h
+        r = data["r_n"] * d
+
+        if r < 20:
+            continue
+
+        # 局部区域 (bounding box + margin)
+        margin = r * 1.20
+        y0 = max(0, int(cy - margin))
+        y1 = min(h, int(cy + margin))
+        x0 = max(0, int(cx - margin))
+        x1 = min(w, int(cx + margin))
+        if y1 - y0 < 20 or x1 - x0 < 20:
+            continue
+
+        # 局部距离平方 (使用 broadcasting)
+        ly = np.arange(y0, y1, dtype=np.float32).reshape(-1, 1)
+        lx = np.arange(x0, x1, dtype=np.float32).reshape(1, -1)
+        dsq = (lx - cx) ** 2 + (ly - cy) ** 2
+
+        # 圈内 (0.85r ~ 0.97r): 环状区域，避免中心点
+        inner_mask = (dsq >= (r * 0.85) ** 2) & (dsq <= (r * 0.97) ** 2)
+        # 圈外 (1.03r ~ 1.15r): 紧贴圈外的区域
+        outer_mask = (dsq >= (r * 1.03) ** 2) & (dsq <= (r * 1.15) ** 2)
+
+        n_in = int(np.sum(inner_mask))
+        n_out = int(np.sum(outer_mask))
+        if n_in < 50 or n_out < 50:
+            continue
+
+        local_smooth = smooth[y0:y1, x0:x1]
+        inner_mean = float(np.mean(local_smooth[inner_mask]))
+        outer_mean = float(np.mean(local_smooth[outer_mask]))
+
+        # 核心评分: 圈内外亮度差 (正值=圈内更亮=缩圈效果)
+        contrast = inner_mean - outer_mean
+        results.append((name, contrast))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    if results:
+        log(f"叠加匹配 Top 5:", "DEBUG")
+        for i, (nm, sc) in enumerate(results[:5]):
+            dd = cache[nm]
+            log(f"  #{i+1}: {nm} 对比度={sc:.1f} "
+                f"cx={dd['cx_n']:.3f} cy={dd['cy_n']:.3f} r={dd['r_n']:.3f}", "DEBUG")
+
+    return results[:TOP_N]
+
+
 # ======================== 可视化 ========================
 
 def save_debug(map_img, circle, all_candidates=None, filename="detected_ring.jpg"):
@@ -420,33 +592,38 @@ def main():
     # 2. 裁剪地图
     map_img = crop_map_from_screenshot(ss_img)
 
-    # 3. 检测圈
-    result = detect_ring_screenshot(map_img)
-    all_candidates = None
-    if result is None:
-        log("裁剪区域未检测到圈，尝试完整截图...", "WARN")
-        result = detect_ring_screenshot(ss_img)
-        if result is None:
-            log("无法检测到缩圈。请确认截图是地图界面。", "ERROR")
-            sys.exit(1)
-        map_img = ss_img
-
-    ring, all_candidates = result
-
-    mh, mw = map_img.shape[:2]
-    log(f"检测到圈: center=({ring[0]:.0f},{ring[1]:.0f}) r={ring[2]:.0f}")
-    log(f"归一化: center=({ring[0]/mw:.4f},{ring[1]/mh:.4f}) r={ring[2]/min(mh,mw):.4f}")
-
-    if DEBUG:
-        save_debug(map_img, ring, all_candidates)
-
-    # 4. 缓存
+    # 3. 加载缓存
     cache = load_cache(force_rebuild)
     if not cache:
         log("缓存为空", "ERROR"); sys.exit(1)
 
-    # 5. 匹配
-    results = match_ring(ring, map_img.shape, cache)
+    # 4. 叠加匹配（主方法：直接比较白色环线与参考圈的吻合度）
+    results = match_by_overlay(map_img, cache)
+
+    if not results:
+        log("叠加匹配失败，回退到圆检测...", "WARN")
+        det = detect_ring_screenshot(map_img)
+        if det is None:
+            log("无法检测到缩圈。请确认截图是地图界面。", "ERROR")
+            sys.exit(1)
+        ring_det, _ = det
+        results = match_ring(ring_det, map_img.shape, cache)
+
+    # 从最佳匹配中获取圈信息用于可视化
+    best_name = results[0][0]
+    best_data = cache[best_name]
+    mh, mw = map_img.shape[:2]
+    md = min(mh, mw)
+    ring = (best_data["cx_n"] * mw, best_data["cy_n"] * mh, best_data["r_n"] * md)
+
+    log(f"匹配圈: center=({ring[0]:.0f},{ring[1]:.0f}) r={ring[2]:.0f}")
+    log(f"归一化: cx={best_data['cx_n']:.4f} cy={best_data['cy_n']:.4f} r={best_data['r_n']:.4f}")
+
+    if DEBUG:
+        save_debug(map_img, ring, filename="detected_ring.jpg")
+        save_comparison(map_img, ring, best_name, cache)
+
+    # 5. 显示结果
     print()
     print("=" * 58)
     print(f"  {'#':<4} {'文件名':<20} {'得分':<10} {'圆心':<18} {'半径'}")
@@ -458,12 +635,9 @@ def main():
     print("=" * 58)
 
     # 6. 打开
-    best = results[0][0]
-    log(f"最佳匹配: {best} (得分: {results[0][1]:.4f})")
-    if DEBUG:
-        save_comparison(map_img, ring, best, cache)
-    os.startfile(str((MAP_DIR / best).resolve()))
-    log(f"已打开 {best}")
+    log(f"最佳匹配: {best_name} (得分: {results[0][1]:.4f})")
+    os.startfile(str((MAP_DIR / best_name).resolve()))
+    log(f"已打开 {best_name}")
     log(f"耗时: {time.time()-t0:.1f}s")
 
 

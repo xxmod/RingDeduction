@@ -2,3 +2,5 @@
 !map
 
 debug/
+
+__pycache__/
