@@ -465,14 +465,25 @@ def match_ring(sc_circle, sc_shape, cache):
 def match_by_overlay(map_img, cache):
     """
     叠加匹配：将缓存中每个参考圈投影到截图上，
-    通过圈内外亮度对比差来找到最佳匹配。
+    通过多径向带角度步进分析找到最佳匹配。
 
-    核心原理：Apex 中缩圈外的区域会有灰暗蒙版叠加，
-    导致圈内区域比圈外区域明显更亮。将参考圈位置投影到截图上，
-    计算"圈内平均亮度 - 圈外平均亮度"，值最大的就是匹配。
+    核心原理：Apex 中缩圈外区域有灰暗蒙版，圈内更亮。
+    在 72 个角度方向上，用 3 组不同紧密度的内外采样点对
+    测量亮度阶跃的方向一致性。
 
-    这种方法不依赖 HoughCircles，不需要检测白色环线，
-    而是利用缩圈的核心视觉特征（内外亮度差）来匹配。
+    正确匹配在所有方向上都有正步进（圈内亮 > 圈外暗）。
+    错位匹配因投影偏移，部分方向上"内点"实际落在真实圈外（或
+    "外点"落在真实圈内），导致步进为零或为负。
+
+    评分 = positive_ratio × (p25 + median × 0.2)
+    - p25: 步进值的 25 分位（对不一致角度敏感）
+    - positive_ratio: 正步进比例（方向一致性）
+    - median: 中位步进值（典型亮度差）
+
+    3 组采样半径从宽到窄:
+    - (0.93r, 1.07r): 捕捉较大偏移
+    - (0.96r, 1.04r): 中等敏感度
+    - (0.98r, 1.02r): 对微小偏移敏感
     """
     gray = cv2.cvtColor(map_img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
@@ -484,15 +495,24 @@ def match_by_overlay(map_img, cache):
         log(f"叠加匹配: 检测到十字线 ({len(ch_rows)}H, {len(ch_cols)}V)", "DEBUG")
         gray = _mask_crosshair(gray, ch_rows, ch_cols)
 
-    # 重度平滑，消除地图纹理/图标/文字的干扰，保留大面积亮度差
+    # 平滑：消除地图纹理/图标/文字，保留大面积亮度差
     smooth = cv2.GaussianBlur(gray, (15, 15), 5).astype(np.float32)
+
+    # 角度采样预计算
+    N_ANGLES = 72  # 每 5 度一个采样点
+    angles = np.linspace(0, 2 * np.pi, N_ANGLES, endpoint=False)
+    cos_a = np.cos(angles)
+    sin_a = np.sin(angles)
+
+    # 3 对采样半径：宽/中/窄，捕捉不同偏移量的错位
+    radius_pairs = [(0.93, 1.07), (0.96, 1.04), (0.98, 1.02)]
 
     results = []
     for name, data in cache.items():
         if "cx_n" not in data:
             continue
 
-        # 将参考圈归一化坐标映射到截图像素坐标
+        # 参考圈归一化坐标映射到截图像素坐标
         cx = data["cx_n"] * w
         cy = data["cy_n"] * h
         r = data["r_n"] * d
@@ -500,48 +520,61 @@ def match_by_overlay(map_img, cache):
         if r < 20:
             continue
 
-        # 局部区域 (bounding box + margin)
-        margin = r * 1.20
-        y0 = max(0, int(cy - margin))
-        y1 = min(h, int(cy + margin))
-        x0 = max(0, int(cx - margin))
-        x1 = min(w, int(cx + margin))
-        if y1 - y0 < 20 or x1 - x0 < 20:
+        all_steps = []
+        for r_in_frac, r_out_frac in radius_pairs:
+            r_in = r * r_in_frac
+            r_out = r * r_out_frac
+
+            raw_ixs = cx + r_in * cos_a
+            raw_iys = cy + r_in * sin_a
+            raw_oxs = cx + r_out * cos_a
+            raw_oys = cy + r_out * sin_a
+
+            # 边界检查：排除超出图像的采样点
+            valid = ((raw_ixs >= 0) & (raw_ixs < w) &
+                     (raw_iys >= 0) & (raw_iys < h) &
+                     (raw_oxs >= 0) & (raw_oxs < w) &
+                     (raw_oys >= 0) & (raw_oys < h))
+
+            valid_idx = np.where(valid)[0]
+            if len(valid_idx) < N_ANGLES * 0.3:
+                continue
+
+            ixs = raw_ixs[valid_idx].astype(int)
+            iys = raw_iys[valid_idx].astype(int)
+            oxs = raw_oxs[valid_idx].astype(int)
+            oys = raw_oys[valid_idx].astype(int)
+
+            inner_vals = smooth[iys, ixs]
+            outer_vals = smooth[oys, oxs]
+            steps = inner_vals - outer_vals
+            all_steps.extend(steps.tolist())
+
+        if len(all_steps) < N_ANGLES:
             continue
 
-        # 局部距离平方 (使用 broadcasting)
-        ly = np.arange(y0, y1, dtype=np.float32).reshape(-1, 1)
-        lx = np.arange(x0, x1, dtype=np.float32).reshape(1, -1)
-        dsq = (lx - cx) ** 2 + (ly - cy) ** 2
+        all_steps_arr = np.array(all_steps)
 
-        # 圈内 (0.85r ~ 0.97r): 环状区域，避免中心点
-        inner_mask = (dsq >= (r * 0.85) ** 2) & (dsq <= (r * 0.97) ** 2)
-        # 圈外 (1.03r ~ 1.15r): 紧贴圈外的区域
-        outer_mask = (dsq >= (r * 1.03) ** 2) & (dsq <= (r * 1.15) ** 2)
+        # 核心评分指标
+        p25 = float(np.percentile(all_steps_arr, 25))
+        median_step = float(np.median(all_steps_arr))
+        positive_ratio = float(np.sum(all_steps_arr > 1.0)) / len(all_steps_arr)
 
-        n_in = int(np.sum(inner_mask))
-        n_out = int(np.sum(outer_mask))
-        if n_in < 50 or n_out < 50:
-            continue
+        # 评分 = 一致性 × (下四分位 + 中位数权重)
+        score = positive_ratio * (p25 + median_step * 0.2)
 
-        local_smooth = smooth[y0:y1, x0:x1]
-        inner_mean = float(np.mean(local_smooth[inner_mask]))
-        outer_mean = float(np.mean(local_smooth[outer_mask]))
-
-        # 核心评分: 圈内外亮度差 (正值=圈内更亮=缩圈效果)
-        contrast = inner_mean - outer_mean
-        results.append((name, contrast))
+        results.append((name, score, median_step, p25, positive_ratio))
 
     results.sort(key=lambda x: x[1], reverse=True)
 
     if results:
         log(f"叠加匹配 Top 5:", "DEBUG")
-        for i, (nm, sc) in enumerate(results[:5]):
+        for i, (nm, sc, ms, p25, pr) in enumerate(results[:5]):
             dd = cache[nm]
-            log(f"  #{i+1}: {nm} 对比度={sc:.1f} "
-                f"cx={dd['cx_n']:.3f} cy={dd['cy_n']:.3f} r={dd['r_n']:.3f}", "DEBUG")
+            log(f"  #{i+1}: {nm} 评分={sc:.1f} 中位步={ms:.1f} P25={p25:.1f} "
+                f"正比={pr:.2f} cx={dd['cx_n']:.3f} cy={dd['cy_n']:.3f}", "DEBUG")
 
-    return results[:TOP_N]
+    return [(name, score) for name, score, *_ in results[:TOP_N]]
 
 
 # ======================== 可视化 ========================
