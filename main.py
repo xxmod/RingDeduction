@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Ring Deduction - Apex Legends 缩圈预测工具 (Broken Moon)
+Ring Deduction - Apex Legends 缩圈预测工具
 
 从游戏截图中检测当前圈的位置和大小，
 在预生成的参考图库中找到最匹配的圈配置图并打开，
 从而预测后续缩圈走向。
+
+支持地图: broken-moon, world's-edge
+在 .env 文件中设置 MAP 变量选择地图。
 
 用法:
     python main.py              # 正常运行
@@ -20,14 +23,38 @@ import sys
 import time
 from pathlib import Path
 
+# ======================== .env 读取 ========================
+
+def load_env(env_path=Path("./.env")):
+    """读取 .env 文件中的配置。"""
+    env = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip()
+    return env
+
+
+_env = load_env()
+
 # ======================== 配置 ========================
 SCREENSHOT_DIR = Path("./screenshot")
-MAP_DIR = Path("./map/broken-moon")
-CACHE_FILE = Path("./ring_cache.json")
+
+# 从 .env 读取当前地图名，默认 broken-moon
+MAP_NAME = _env.get("MAP", "broken-moon")
+MAP_DIR = Path(f"./map/{MAP_NAME}")
+CACHE_FILE = Path(f"./{MAP_NAME}-cache.json")
 DEBUG_DIR = Path("./debug")
 
 TOP_N = 5        # 显示前 N 个最佳匹配
 DEBUG = True      # 是否保存调试图
+
+# 可用地图列表
+AVAILABLE_MAPS = ["broken-moon", "world's-edge"]
 
 
 # ======================== 工具函数 ========================
@@ -573,6 +600,14 @@ def main():
     global DEBUG
     if "--no-debug" in sys.argv:
         DEBUG = False
+
+    # 0. 验证地图配置
+    log(f"当前地图: {MAP_NAME}")
+    if MAP_NAME not in AVAILABLE_MAPS:
+        log(f"未知地图 '{MAP_NAME}'，可用: {', '.join(AVAILABLE_MAPS)}", "WARN")
+    if not MAP_DIR.exists():
+        log(f"地图目录不存在: {MAP_DIR}", "ERROR")
+        sys.exit(1)
 
     # 1. 最新截图（或指定文件）
     if "--file" in sys.argv:
