@@ -61,7 +61,7 @@ def imread_safe(filepath):
 
 # 从游戏截图中裁剪地图区域的比例 (left, top, right, bottom)
 # 适用于 16:9 分辨率 (1920×1080 等)
-SCREENSHOT_MAP_CROP = (0.245, 0.035, 0.745, 0.905)
+SCREENSHOT_MAP_CROP = (0.255, 0.035, 0.745, 0.905)
 
 
 def crop_map_from_screenshot(img):
