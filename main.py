@@ -464,26 +464,21 @@ def match_ring(sc_circle, sc_shape, cache):
 
 def match_by_overlay(map_img, cache):
     """
-    叠加匹配：将缓存中每个参考圈投影到截图上，
-    通过多径向带角度步进分析找到最佳匹配。
+    叠加匹配（圈位置检测 + 自适应权重匹配）:
 
-    核心原理：Apex 中缩圈外区域有灰暗蒙版，圈内更亮。
-    在 72 个角度方向上，用 3 组不同紧密度的内外采样点对
-    测量亮度阶跃的方向一致性。
+    三阶段匹配策略：
+    1. 超精细网格扫描：在截图中直接搜索圈边界，找到实际圈中心（0.1% 精度）
+    2. 距离排序：按检测位置与参考圈的归一化距离排序
+    3. 自适应权重评分：每个候选的叠加权重由其自身 overlay 强度决定
+       - overlay 强的候选 → 以 overlay 为主（能精确匹配圈边界）
+       - overlay 弱的候选 → 以距离为主（几何位置更可靠）
+       - 网格偏移搜索补偿微小位置差异
 
-    正确匹配在所有方向上都有正步进（圈内亮 > 圈外暗）。
-    错位匹配因投影偏移，部分方向上"内点"实际落在真实圈外（或
-    "外点"落在真实圈内），导致步进为零或为负。
-
-    评分 = positive_ratio × (p25 + median × 0.2)
-    - p25: 步进值的 25 分位（对不一致角度敏感）
-    - positive_ratio: 正步进比例（方向一致性）
-    - median: 中位步进值（典型亮度差）
-
-    3 组采样半径从宽到窄:
-    - (0.93r, 1.07r): 捕捉较大偏移
-    - (0.96r, 1.04r): 中等敏感度
-    - (0.98r, 1.02r): 对微小偏移敏感
+    自适应权重原理：
+    - ow_frac = max(floor, overlay_pos / (overlay_pos + K))
+    - combined = dist_score * (1 - ow_frac) + ov_norm * ow_frac
+    - 当 overlay >> K 时，ow_frac → 1，overlay 主导
+    - 当 overlay ≈ 0 时，ow_frac → floor，距离主导
     """
     gray = cv2.cvtColor(map_img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
@@ -495,84 +490,197 @@ def match_by_overlay(map_img, cache):
         log(f"叠加匹配: 检测到十字线 ({len(ch_rows)}H, {len(ch_cols)}V)", "DEBUG")
         gray = _mask_crosshair(gray, ch_rows, ch_cols)
 
-    # 平滑：消除地图纹理/图标/文字，保留大面积亮度差
+    # 平滑
     smooth = cv2.GaussianBlur(gray, (15, 15), 5).astype(np.float32)
 
     # 角度采样预计算
-    N_ANGLES = 72  # 每 5 度一个采样点
+    N_ANGLES = 72
     angles = np.linspace(0, 2 * np.pi, N_ANGLES, endpoint=False)
     cos_a = np.cos(angles)
     sin_a = np.sin(angles)
 
-    # 3 对采样半径：宽/中/窄，捕捉不同偏移量的错位
+    # 仅用最宽带做快速扫描
+    WIDE_IN, WIDE_OUT = 0.93, 1.07
+    # 全部3对用于精确验证
     radius_pairs = [(0.93, 1.07), (0.96, 1.04), (0.98, 1.02)]
 
-    results = []
-    for name, data in cache.items():
-        if "cx_n" not in data:
-            continue
+    def _quick_score(cx, cy, r):
+        """仅用最宽带的快速角度步进评分。"""
+        r_in = r * WIDE_IN
+        r_out = r * WIDE_OUT
+        ixs = cx + r_in * cos_a
+        iys = cy + r_in * sin_a
+        oxs = cx + r_out * cos_a
+        oys = cy + r_out * sin_a
+        valid = ((ixs >= 0) & (ixs < w) & (iys >= 0) & (iys < h) &
+                 (oxs >= 0) & (oxs < w) & (oys >= 0) & (oys < h))
+        idx = np.where(valid)[0]
+        if len(idx) < N_ANGLES * 0.4:
+            return -999
+        iv = smooth[iys[idx].astype(int), ixs[idx].astype(int)]
+        ov = smooth[oys[idx].astype(int), oxs[idx].astype(int)]
+        steps = iv - ov
+        med = float(np.median(steps))
+        pos = float(np.sum(steps > 1.0)) / len(steps)
+        p25 = float(np.percentile(steps, 25))
+        return pos * (p25 + med * 0.2)
 
-        # 参考圈归一化坐标映射到截图像素坐标
-        cx = data["cx_n"] * w
-        cy = data["cy_n"] * h
-        r = data["r_n"] * d
-
-        if r < 20:
-            continue
-
+    def _full_score(cx, cy, r):
+        """3对采样半径的完整角度步进评分。"""
         all_steps = []
         for r_in_frac, r_out_frac in radius_pairs:
             r_in = r * r_in_frac
             r_out = r * r_out_frac
-
-            raw_ixs = cx + r_in * cos_a
-            raw_iys = cy + r_in * sin_a
-            raw_oxs = cx + r_out * cos_a
-            raw_oys = cy + r_out * sin_a
-
-            # 边界检查：排除超出图像的采样点
-            valid = ((raw_ixs >= 0) & (raw_ixs < w) &
-                     (raw_iys >= 0) & (raw_iys < h) &
-                     (raw_oxs >= 0) & (raw_oxs < w) &
-                     (raw_oys >= 0) & (raw_oys < h))
-
-            valid_idx = np.where(valid)[0]
-            if len(valid_idx) < N_ANGLES * 0.3:
+            ixs = cx + r_in * cos_a
+            iys = cy + r_in * sin_a
+            oxs = cx + r_out * cos_a
+            oys = cy + r_out * sin_a
+            valid = ((ixs >= 0) & (ixs < w) & (iys >= 0) & (iys < h) &
+                     (oxs >= 0) & (oxs < w) & (oys >= 0) & (oys < h))
+            idx = np.where(valid)[0]
+            if len(idx) < N_ANGLES * 0.3:
                 continue
-
-            ixs = raw_ixs[valid_idx].astype(int)
-            iys = raw_iys[valid_idx].astype(int)
-            oxs = raw_oxs[valid_idx].astype(int)
-            oys = raw_oys[valid_idx].astype(int)
-
-            inner_vals = smooth[iys, ixs]
-            outer_vals = smooth[oys, oxs]
-            steps = inner_vals - outer_vals
+            iv = smooth[iys[idx].astype(int), ixs[idx].astype(int)]
+            ov = smooth[oys[idx].astype(int), oxs[idx].astype(int)]
+            steps = iv - ov
             all_steps.extend(steps.tolist())
-
         if len(all_steps) < N_ANGLES:
+            return -999, 0, 0, 0
+        arr = np.array(all_steps)
+        p25 = float(np.percentile(arr, 25))
+        med = float(np.median(arr))
+        pr = float(np.sum(arr > 1.0)) / len(arr)
+        return pr * (p25 + med * 0.2), med, p25, pr
+
+    # ========== 阶段 1: 超精细网格扫描检测圈位置 ==========
+    # 用所有参考圈的中位半径作为预期值
+    r_values = [data["r_n"] for data in cache.values() if "r_n" in data]
+    median_r_n = float(np.median(r_values))
+    scan_r = median_r_n * d
+
+    # 粗扫描: 2% 步进，覆盖 20%~80%
+    best_scan = -999
+    best_cx_n, best_cy_n = 0.5, 0.5
+    for cx_frac in np.arange(0.20, 0.81, 0.02):
+        for cy_frac in np.arange(0.20, 0.81, 0.02):
+            s = _quick_score(cx_frac * w, cy_frac * h, scan_r)
+            if s > best_scan:
+                best_scan = s
+                best_cx_n, best_cy_n = cx_frac, cy_frac
+
+    # 中扫描: 0.5% 步进，在粗结果附近 ±3%
+    for cx_frac in np.arange(best_cx_n - 0.03, best_cx_n + 0.031, 0.005):
+        for cy_frac in np.arange(best_cy_n - 0.03, best_cy_n + 0.031, 0.005):
+            s = _quick_score(cx_frac * w, cy_frac * h, scan_r)
+            if s > best_scan:
+                best_scan = s
+                best_cx_n, best_cy_n = cx_frac, cy_frac
+
+    # 精扫描: 0.1% 步进，在中结果附近 ±1%
+    for cx_frac in np.arange(best_cx_n - 0.01, best_cx_n + 0.011, 0.001):
+        for cy_frac in np.arange(best_cy_n - 0.01, best_cy_n + 0.011, 0.001):
+            s = _quick_score(cx_frac * w, cy_frac * h, scan_r)
+            if s > best_scan:
+                best_scan = s
+                best_cx_n, best_cy_n = cx_frac, cy_frac
+
+    # 搜索半径: 粗+精
+    best_r_n = median_r_n
+    for r_scale in np.arange(0.88, 1.13, 0.01):
+        r_try = median_r_n * r_scale
+        s = _quick_score(best_cx_n * w, best_cy_n * h, r_try * d)
+        if s > best_scan:
+            best_scan = s
+            best_r_n = r_try
+    for r_scale in np.arange(best_r_n / median_r_n - 0.02,
+                              best_r_n / median_r_n + 0.021, 0.002):
+        r_try = median_r_n * r_scale
+        s = _quick_score(best_cx_n * w, best_cy_n * h, r_try * d)
+        if s > best_scan:
+            best_scan = s
+            best_r_n = r_try
+
+    det_cx = best_cx_n
+    det_cy = best_cy_n
+    det_r = best_r_n
+
+    log(f"圈扫描: cx={det_cx:.4f} cy={det_cy:.4f} r={det_r:.4f} "
+        f"score={best_scan:.1f}", "DEBUG")
+
+    # ========== 阶段 2: 距离排序 + 自适应权重叠加验证 ==========
+    # 对所有参考，计算到检测位置的归一化距离
+    candidates = []
+    for name, data in cache.items():
+        if "cx_n" not in data:
             continue
+        dx = det_cx - data["cx_n"]
+        dy = det_cy - data["cy_n"]
+        dr = det_r - data["r_n"]
+        dist = np.sqrt(dx ** 2 + dy ** 2) + abs(dr) * 0.3
+        candidates.append((name, dist, data))
 
-        all_steps_arr = np.array(all_steps)
+    candidates.sort(key=lambda x: x[1])
 
-        # 核心评分指标
-        p25 = float(np.percentile(all_steps_arr, 25))
-        median_step = float(np.median(all_steps_arr))
-        positive_ratio = float(np.sum(all_steps_arr > 1.0)) / len(all_steps_arr)
+    # 自适应权重参数
+    N_VERIFY = min(50, len(candidates))
+    GRID_STEP = 0.005          # 网格步进: 0.5%
+    GRID_SIZE = 0.005          # 网格范围: ±0.5%
+    GRID_PENALTY_RATE = 800.0  # 偏移惩罚: shift_dist * 800
+    GRID_ALPHA = 2.0           # 网格提升放大系数
+    DIST_K = 1.5               # 距离衰减系数（较平坦）
+    ADAPT_K = 10.0             # 自适应常数: overlay/(overlay+K) 决定权重分配
+    ADAPT_FLOOR = 0.3          # 最低 overlay 权重分数
 
-        # 评分 = 一致性 × (下四分位 + 中位数权重)
-        score = positive_ratio * (p25 + median_step * 0.2)
+    results = []
+    for name, dist, data in candidates[:N_VERIFY]:
+        cx_ref = data["cx_n"] * w
+        cy_ref = data["cy_n"] * h
+        r_ref = data["r_n"] * d
 
-        results.append((name, score, median_step, p25, positive_ratio))
+        # === 原位完整评分 (3 对半径带, 最高精度) ===
+        base_ov, best_med, best_p25, best_pr = _full_score(cx_ref, cy_ref, r_ref)
+
+        # === 网格偏移搜索 ===
+        grid_bonus = 0
+        for dxg in np.arange(-GRID_SIZE, GRID_SIZE + 0.001, GRID_STEP):
+            for dyg in np.arange(-GRID_SIZE, GRID_SIZE + 0.001, GRID_STEP):
+                if abs(dxg) < 1e-6 and abs(dyg) < 1e-6:
+                    continue
+                cx_try = cx_ref + dxg * w
+                cy_try = cy_ref + dyg * h
+                grid_ov, _, _, _ = _full_score(cx_try, cy_try, r_ref)
+                shift_dist = np.sqrt(dxg ** 2 + dyg ** 2)
+                penalty = shift_dist * GRID_PENALTY_RATE
+                improve = max(0, (grid_ov - penalty) - base_ov) * GRID_ALPHA
+                grid_bonus = max(grid_bonus, improve)
+
+        best_ov = base_ov + grid_bonus
+
+        # --- 自适应综合评分 ---
+        # 距离分: 1/(1 + dist * 1.5)，较平坦，让近距离候选差异不大
+        dist_score = 1.0 / (1.0 + dist * DIST_K)
+
+        # 叠加归一化
+        ov_pos = max(0, best_ov)
+        ov_norm = ov_pos / 30.0
+
+        # 自适应权重: overlay 越强，越信任 overlay；否则信任距离
+        ow_frac = max(ADAPT_FLOOR, ov_pos / (ov_pos + ADAPT_K))
+
+        # 综合: 距离贡献 × (1-权重) + 叠加贡献 × 权重
+        combined = dist_score * (1.0 - ow_frac) + ov_norm * ow_frac
+
+        results.append((name, combined, dist, best_ov, best_med, best_p25, best_pr))
 
     results.sort(key=lambda x: x[1], reverse=True)
 
     if results:
         log(f"叠加匹配 Top 5:", "DEBUG")
-        for i, (nm, sc, ms, p25, pr) in enumerate(results[:5]):
+        for i, (nm, sc, dist, ov, ms, p25, pr) in enumerate(results[:5]):
             dd = cache[nm]
-            log(f"  #{i+1}: {nm} 评分={sc:.1f} 中位步={ms:.1f} P25={p25:.1f} "
-                f"正比={pr:.2f} cx={dd['cx_n']:.3f} cy={dd['cy_n']:.3f}", "DEBUG")
+            log(f"  #{i+1}: {nm} 综合={sc:.1f} 距离={dist:.4f} "
+                f"叠加={ov:.1f} P25={p25:.1f} 正比={pr:.2f} "
+                f"cx={dd['cx_n']:.3f} cy={dd['cy_n']:.3f}", "DEBUG")
 
     return [(name, score) for name, score, *_ in results[:TOP_N]]
 
@@ -605,25 +713,90 @@ def save_debug(map_img, circle, all_candidates=None, filename="detected_ring.jpg
     log(f"调试图 -> {DEBUG_DIR / filename}")
 
 
-def save_comparison(map_img, sc_circle, best_name, cache):
+def save_comparison(map_img, sc_circle, results, cache):
     DEBUG_DIR.mkdir(exist_ok=True)
     vis = map_img.copy()
     cx, cy, r = int(sc_circle[0]), int(sc_circle[1]), int(sc_circle[2])
     cv2.circle(vis, (cx, cy), r, (0, 255, 0), 3)
-    cv2.putText(vis, "Screenshot", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(vis, "Screenshot", (20, 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
-    ref = imread_safe(MAP_DIR / best_name)
-    if ref is not None:
-        d = cache[best_name]
+    # 在截图中叠加 Top5 候选圈（不同颜色）
+    cand_colors = [
+        (255, 80, 80),
+        (80, 200, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 180, 0),
+    ]
+    mh, mw = map_img.shape[:2]
+    md = min(mh, mw)
+    for i, (name, _score) in enumerate(results[:5], 1):
+        d = cache.get(name)
+        if not d:
+            continue
+        ccx = int(d["cx_n"] * mw)
+        ccy = int(d["cy_n"] * mh)
+        cr = int(d["r_n"] * md)
+        col = cand_colors[i - 1] if i - 1 < len(cand_colors) else (180, 180, 180)
+        cv2.circle(vis, (ccx, ccy), cr, col, 2)
+        cv2.putText(vis, f"#{i}", (ccx - 12, ccy - cr - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
+
+    # 3x2 布局：截图 + Top5 候选
+    md = min(mh, mw)
+    sc_cx_n = sc_circle[0] / mw
+    sc_cy_n = sc_circle[1] / mh
+    sc_r_n = sc_circle[2] / md
+
+    tiles = [vis]
+    for i, (name, score) in enumerate(results[:5], 1):
+        ref = imread_safe(MAP_DIR / name)
+        if ref is None:
+            continue
+        d = cache[name]
+        rh, rw = ref.shape[:2]
+        rmd = min(rh, rw)
+
+        # 候选图自身圈（绿色）
         cv2.circle(ref, (int(d["cx"]), int(d["cy"])), int(d["r"]), (0, 255, 0), 3)
-        cv2.putText(ref, best_name, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        th = 600
-        s1 = cv2.resize(vis, (int(vis.shape[1] * th / vis.shape[0]), th))
-        s2 = cv2.resize(ref, (int(ref.shape[1] * th / ref.shape[0]), th))
-        cv2.imwrite(str(DEBUG_DIR / "comparison.jpg"), np.hstack([s1, s2]))
-        log(f"对比图 -> {DEBUG_DIR / 'comparison.jpg'}")
+        # 截图识别圈投影到候选图（红色）
+        scx = int(sc_cx_n * rw)
+        scy = int(sc_cy_n * rh)
+        sr = int(sc_r_n * rmd)
+        cv2.circle(ref, (scx, scy), sr, (0, 0, 255), 3)
+
+        cv2.putText(ref, f"#{i} {name}", (20, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv2.putText(ref, f"score={score:.4f}", (20, 88),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+        tiles.append(ref)
+
+    # 分辨率提高：每个格子统一到 1000x700，再拼成 3000x1400
+    tile_w, tile_h = 1000, 700
+    bg_color = (30, 30, 30)
+
+    def _fit_tile(img):
+        h, w = img.shape[:2]
+        scale = min(tile_w / w, tile_h / h)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+        canvas = np.full((tile_h, tile_w, 3), bg_color, dtype=np.uint8)
+        x0 = (tile_w - nw) // 2
+        y0 = (tile_h - nh) // 2
+        canvas[y0:y0+nh, x0:x0+nw] = resized
+        return canvas
+
+    while len(tiles) < 6:
+        tiles.append(np.full_like(vis, 0))
+
+    tiles = [_fit_tile(img) for img in tiles[:6]]
+    top_row = np.hstack(tiles[:3])
+    bottom_row = np.hstack(tiles[3:6])
+    out = np.vstack([top_row, bottom_row])
+
+    cv2.imwrite(str(DEBUG_DIR / "comparison.jpg"), out)
+    log(f"对比图 -> {DEBUG_DIR / 'comparison.jpg'}")
 
 
 # ======================== 主流程 ========================
@@ -667,7 +840,7 @@ def process_screenshot(ss_path, cache):
 
     if DEBUG:
         save_debug(map_img, ring, filename="detected_ring.jpg")
-        save_comparison(map_img, ring, best_name, cache)
+        save_comparison(map_img, ring, results, cache)
 
     # 显示结果
     print()
