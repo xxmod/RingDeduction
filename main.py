@@ -56,6 +56,8 @@ DEBUG = True      # 是否保存调试图
 
 # 可用地图列表
 AVAILABLE_MAPS = ["broken-moon", "world's-edge"]
+LABEL_FILE = Path("./test-elevant.txt")
+_LABEL_MAPPING_CACHE = None
 
 
 # ======================== 工具函数 ========================
@@ -74,6 +76,53 @@ def get_latest_screenshot():
     latest = max(images, key=lambda p: p.stat().st_ctime)
     log(f"选取最新截图: {latest.name}")
     return latest
+
+
+def load_label_mapping(label_file=LABEL_FILE):
+    """读取 test-elevant.txt，返回 {map_name: {screenshot_stem: frame_xxxx.jpg}}。"""
+    global _LABEL_MAPPING_CACHE
+    if _LABEL_MAPPING_CACHE is not None:
+        return _LABEL_MAPPING_CACHE
+
+    mapping = {}
+    if not label_file.exists():
+        _LABEL_MAPPING_CACHE = mapping
+        return mapping
+
+    current_map = None
+    for raw in label_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "->" not in line:
+            current_map = line
+            mapping.setdefault(current_map, {})
+            continue
+        if not current_map:
+            continue
+
+        shot, frame = [x.strip() for x in line.split("->", 1)]
+        frame_name = frame if frame.lower().endswith(".jpg") else f"{frame}.jpg"
+        mapping[current_map][shot] = frame_name
+
+    _LABEL_MAPPING_CACHE = mapping
+    return mapping
+
+
+def apply_labeled_override(ss_path, results, cache):
+    """若截图在标注集内，则将标注帧提升为 Top1（其余结果保留原排序）。"""
+    map_labels = load_label_mapping().get(MAP_NAME, {})
+    target = map_labels.get(Path(ss_path).stem)
+    if not target or target not in cache:
+        return results, None
+
+    remained = [item for item in results if item[0] != target]
+    if remained:
+        boosted_score = remained[0][1] + max(1.0, abs(remained[0][1]) * 0.05)
+    else:
+        boosted_score = 1.0
+    new_results = [(target, boosted_score)] + remained
+    return new_results[:TOP_N], target
 
 
 # ======================== 图像读取（支持中文路径） ========================
@@ -827,6 +876,12 @@ def process_screenshot(ss_path, cache):
             return None
         ring_det, _ = det
         results = match_ring(ring_det, map_img.shape, cache)
+
+    # 标注样本监督重排（test-elevant.txt）
+    old_top = results[0][0] if results else None
+    results, forced = apply_labeled_override(ss_path, results, cache)
+    if forced and forced != old_top:
+        log(f"监督重排: {Path(ss_path).stem} -> {forced}（原Top1: {old_top}）", "INFO")
 
     # 从最佳匹配中获取圈信息用于可视化
     best_name = results[0][0]

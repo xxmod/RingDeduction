@@ -1,8 +1,10 @@
 *.png
-!map
+!map/
+!testfile/
+!map/**
+!testfile/**
 
 debug/
-
 __pycache__/
 
 .env

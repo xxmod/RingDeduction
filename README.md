@@ -56,6 +56,31 @@ python main.py --rebuild
 python main.py --file screenshot/example.png --no-debug
 ```
 
+## 测试集准确率评估（Top1 / Top5）
+
+根目录提供评估脚本 `eval_testfile.py`，用于统计 `testfile/` 中截图的 Top1 / Top5 命中率。
+
+默认输入：
+- 测试截图目录：`testfile/`
+- 标注文件：`testfile/test-elevant.txt`
+
+```bash
+# 详细输出（逐张显示 GT / P1 / H1 / H5）
+python eval_testfile.py
+
+# 仅输出汇总
+python eval_testfile.py --quiet
+
+# 指定目录与标注
+python eval_testfile.py --dir testfile --labels testfile/test-elevant.txt
+```
+
+汇总字段说明：
+- `Top1 命中`：预测第 1 名与标注一致的数量与比例
+- `Top5 命中`：标注结果出现在前 5 名候选中的数量与比例
+- `缺失截图文件`：标注里有但目录中找不到的截图数
+- `无预测结果`：算法未返回候选结果的样本数
+
 ## 目录结构
 
 ```
