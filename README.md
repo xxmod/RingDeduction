@@ -9,7 +9,7 @@
 ## 支持地图
 
 - `broken-moon` — 破碎月球（326 种圈配置）
-- `world's-edge` — 世界尽头（48 种圈配置）
+- `world's-edge` — 世界尽头（280 种圈配置）
 
 ## 快速开始
 
@@ -39,11 +39,12 @@ python main.py
 
 ## 命令行参数
 
-| 参数              | 说明                           |
-| ----------------- | ------------------------------ |
-| `--file <路径>` | 指定截图文件，而非自动选取最新 |
-| `--rebuild`     | 强制重建参考图缓存             |
-| `--no-debug`    | 关闭调试图输出                 |
+| 参数              | 说明                             |
+| ----------------- | -------------------------------- |
+| `--file <路径>` | 指定截图文件，而非自动选取最新   |
+| `--rebuild`     | 强制重建参考图缓存               |
+| `--no-debug`    | 关闭调试图输出                   |
+| `--constant`    | 持续从截图文件夹中读取最新的截图 |
 
 ```bash
 # 指定截图
@@ -61,6 +62,7 @@ python main.py --file screenshot/example.png --no-debug
 根目录提供评估脚本 `eval_testfile.py`，用于统计 `testfile/` 中截图的 Top1 / Top5 命中率。
 
 默认输入：
+
 - 测试截图目录：`testfile/`
 - 标注文件：`testfile/test-elevant.txt`
 
@@ -76,6 +78,7 @@ python eval_testfile.py --dir testfile --labels testfile/test-elevant.txt
 ```
 
 汇总字段说明：
+
 - `Top1 命中`：预测第 1 名与标注一致的数量与比例
 - `Top5 命中`：标注结果出现在前 5 名候选中的数量与比例
 - `缺失截图文件`：标注里有但目录中找不到的截图数
@@ -90,7 +93,7 @@ RingDeduction/
 ├── requirements.txt            # Python 依赖
 ├── screenshot/                 # 游戏截图（放入此目录）
 ├── map/
-│   ├── broken-moon/            # 破碎月球参考图
+│   ├── broken-moon/            # 残月参考图
 │   └── world's-edge/           # 世界尽头参考图
 ├── broken-moon-cache.json      # 破碎月球缓存（自动生成）
 ├── world's-edge-cache.json     # 世界尽头缓存（自动生成）
