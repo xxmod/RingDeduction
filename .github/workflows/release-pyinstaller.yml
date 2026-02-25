@@ -1,0 +1,74 @@
+name: Build & Release (PyInstaller)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          pyinstaller --clean --noconfirm --onefile --name RingDeduction main.py
+
+      - name: Prepare release package
+        id: package
+        shell: pwsh
+        run: |
+          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "manual-${{ github.run_number }}" }
+          $packageName = "RingDeduction-$version-windows-x64"
+          $packageDir = Join-Path "out" $packageName
+
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "screenshot") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "debug") | Out-Null
+
+          Copy-Item "dist/RingDeduction.exe" -Destination $packageDir -Force
+          Copy-Item "map" -Destination $packageDir -Recurse -Force
+          Copy-Item "broken-moon-cache.json" -Destination $packageDir -Force
+          Copy-Item "world's-edge-cache.json" -Destination $packageDir -Force
+          Copy-Item "README.md" -Destination $packageDir -Force
+
+          "MAP=broken-moon" | Out-File -Encoding UTF8 -FilePath (Join-Path $packageDir ".env") -Force
+
+          $zipPath = Join-Path "out" "$packageName.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "$packageDir/*" -DestinationPath $zipPath
+
+          "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RingDeduction-windows-x64
+          path: ${{ steps.package.outputs.zip_path }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.zip_path }}
+          generate_release_notes: true
