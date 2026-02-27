@@ -46,6 +46,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "screenshot") | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "debug") | Out-Null
 
+          # Add .gitkeep so empty directories are preserved in zip / artifact
+          New-Item -ItemType File -Force -Path (Join-Path $packageDir "screenshot/.gitkeep") | Out-Null
+          New-Item -ItemType File -Force -Path (Join-Path $packageDir "debug/.gitkeep") | Out-Null
+
           Copy-Item "dist/RingDeduction.exe" -Destination $packageDir -Force
           Copy-Item "map" -Destination $packageDir -Recurse -Force
           Copy-Item "broken-moon-cache.json" -Destination $packageDir -Force
@@ -59,12 +63,13 @@ jobs:
           Compress-Archive -Path "$packageDir/*" -DestinationPath $zipPath
 
           "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "package_dir=$packageDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: RingDeduction-windows-x64
-          path: ${{ steps.package.outputs.zip_path }}
+          path: ${{ steps.package.outputs.package_dir }}
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
