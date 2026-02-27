@@ -52,8 +52,6 @@ jobs:
 
           Copy-Item "dist/RingDeduction.exe" -Destination $packageDir -Force
           Copy-Item "map" -Destination $packageDir -Recurse -Force
-          Copy-Item "broken-moon-cache.json" -Destination $packageDir -Force
-          Copy-Item "world's-edge-cache.json" -Destination $packageDir -Force
           Copy-Item "README.md" -Destination $packageDir -Force
 
           "MAP=broken-moon" | Out-File -Encoding UTF8 -FilePath (Join-Path $packageDir ".env") -Force
