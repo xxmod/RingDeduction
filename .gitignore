@@ -10,3 +10,5 @@ __pycache__/
 .env
 
 copilot-instructions.md
+
+*-cache.json
