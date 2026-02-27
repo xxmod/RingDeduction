@@ -69,6 +69,10 @@ def log(msg, level="INFO"):
 def get_latest_screenshot():
     """选取 screenshot 目录中创建时间最新的图片。"""
     exts = {'.png', '.jpg', '.jpeg', '.bmp'}
+    if not SCREENSHOT_DIR.exists():
+        SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        log(f"未找到 {SCREENSHOT_DIR} 文件夹，已自动创建。请将截图放入该文件夹。", "ERROR")
+        sys.exit(1)
     images = [f for f in SCREENSHOT_DIR.iterdir() if f.suffix.lower() in exts]
     if not images:
         log(f"在 {SCREENSHOT_DIR} 中未找到图片文件", "ERROR")
