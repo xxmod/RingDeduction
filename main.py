@@ -51,6 +51,10 @@ MAP_DIR = Path(f"./map/{MAP_NAME}")
 CACHE_FILE = Path(f"./{MAP_NAME}-cache.json")
 DEBUG_DIR = Path("./debug")
 
+# 从 .env 读取宽高比，用于拉伸模式下无法自动检测的情况
+# 可选值: "16:9" / "16:10" / "4:3" / "auto"（默认，按截图像素自动判断）
+ASPECT_RATIO = _env.get("ASPECT_RATIO", "auto")
+
 TOP_N = 5        # 显示前 N 个最佳匹配
 DEBUG = True      # 是否保存调试图
 
@@ -141,19 +145,71 @@ def imread_safe(filepath):
 # ======================== 地图裁剪 ========================
 
 # 从游戏截图中裁剪地图区域的比例 (left, top, right, bottom)
-# 适用于 16:9 分辨率 (1920×1080 等)
-SCREENSHOT_MAP_CROP = (0.255, 0.035, 0.745, 0.905)
+# 按宽高比分别配置；16:10 开启拉伸后 UI 位置与 16:9 不同
+CROP_PROFILES = {
+    "16:9":  (0.255, 0.035, 0.745, 0.905),
+    "16:10": (0.271, 0.105, 0.729, 0.835)
+}
+
+# 拉伸校正：游戏地图区域始终为正方形，
+# 但某些宽高比（如 16:10 拉伸模式）裁剪后不是正方形，需要校正。
+# 设为 True 的宽高比会在裁剪后将图像 resize 为正方形。
+SQUARE_CORRECTION = {
+    "16:10": True
+}
+
+
+def detect_aspect_ratio(w, h):
+    """
+    根据截图宽高判断宽高比类型。
+    返回 "16:9" / "16:10" / "4:3" / "unknown"。
+    """
+    ratio = w / h
+    if abs(ratio - 16 / 9) < 0.03:        # ~1.778
+        return "16:9"
+    elif abs(ratio - 16 / 10) < 0.03:      # ~1.600
+        return "16:10"
+    elif abs(ratio - 4 / 3) < 0.03:        # ~1.333
+        return "4:3"
+    else:
+        return "unknown"
 
 
 def crop_map_from_screenshot(img):
     """
     从 Apex Legends 全屏地图截图中提取地图区域。
-    使用固定比例裁剪，去除左侧挑战面板、右下图例面板、底部操作栏等 UI。
+    优先使用 .env 中 ASPECT_RATIO 配置；若为 "auto" 则按像素自动判断。
+    裁剪后若不是正方形，会 resize 为正方形（地图区域始终是正方形）。
     """
     h, w = img.shape[:2]
-    l, t, r, b = SCREENSHOT_MAP_CROP
+    if ASPECT_RATIO != "auto":
+        ar = ASPECT_RATIO
+        log(f"截图宽高比: {ar}（.env 指定, {w}×{h}）")
+    else:
+        ar = detect_aspect_ratio(w, h)
+        log(f"截图宽高比: {ar}（自动检测, {w}×{h}）")
+
+    crop = CROP_PROFILES.get(ar)
+    if crop is None:
+        if ar == "4:3":
+            log("4:3 裁剪参数尚未配置，回退到 16:9", "WARN")
+        else:
+            log(f"未知宽高比 {ar}，回退到 16:9", "WARN")
+        crop = CROP_PROFILES["16:9"]
+
+    l, t, r, b = crop
     cropped = img[int(h * t):int(h * b), int(w * l):int(w * r)]
     log(f"裁剪: ({int(w*l)},{int(h*t)})-({int(w*r)},{int(h*b)}) -> {cropped.shape[1]}×{cropped.shape[0]}")
+
+    # 正方化校正：地图区域始终为正方形，裁剪后若不是正方形则 resize
+    if SQUARE_CORRECTION.get(ar, False):
+        ch, cw = cropped.shape[:2]
+        if abs(cw - ch) > 5:
+            side = max(cw, ch)
+            cropped = cv2.resize(cropped, (side, side),
+                                 interpolation=cv2.INTER_AREA if side < max(cw, ch) else cv2.INTER_CUBIC)
+            log(f"正方化校正 ({ar}): {cw}×{ch} -> {side}×{side}")
+
     return cropped
 
 
