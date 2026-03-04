@@ -60,8 +60,8 @@ jobs:
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
           Compress-Archive -Path $packageDir -DestinationPath $zipPath
 
-          "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "package_dir=$packageDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_path=$($zipPath.Replace('\', '/'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "package_dir=$($packageDir.Replace('\', '/'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
