@@ -58,7 +58,7 @@ jobs:
 
           $zipPath = Join-Path "out" "$packageName.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path "$packageDir/*" -DestinationPath $zipPath
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath
 
           "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "package_dir=$packageDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
