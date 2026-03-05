@@ -148,14 +148,8 @@ def imread_safe(filepath):
 # 按宽高比分别配置；16:10 开启拉伸后 UI 位置与 16:9 不同
 CROP_PROFILES = {
     "16:9":  (0.255, 0.035, 0.745, 0.905),
-    "16:10": (0.271, 0.105, 0.729, 0.835)
-}
-
-# 拉伸校正：游戏地图区域始终为正方形，
-# 但某些宽高比（如 16:10 拉伸模式）裁剪后不是正方形，需要校正。
-# 设为 True 的宽高比会在裁剪后将图像 resize 为正方形。
-SQUARE_CORRECTION = {
-    "16:10": True
+    "16:10": (0.271, 0.105, 0.729, 0.835),
+    "4:3":   None,  # TODO: 待补充 4:3 裁剪参数
 }
 
 
@@ -179,14 +173,20 @@ def crop_map_from_screenshot(img):
     """
     从 Apex Legends 全屏地图截图中提取地图区域。
     优先使用 .env 中 ASPECT_RATIO 配置；若为 "auto" 则按像素自动判断。
-    裁剪后若不是正方形，会 resize 为正方形（地图区域始终是正方形）。
+    
+    拉伸模式检测：
+    - 原生 16:10（1920×1200）：截图像素本身是 16:10，裁剪即可
+    - 拉伸 16:10（1920×1080 拉伸显示）：截图像素是 16:9 但 UI 按 16:10 布局，
+      裁剪后需正方化以还原地图的正方形区域
     """
     h, w = img.shape[:2]
+    actual_ar = detect_aspect_ratio(w, h)  # 检测截图实际像素比例
+    
     if ASPECT_RATIO != "auto":
         ar = ASPECT_RATIO
-        log(f"截图宽高比: {ar}（.env 指定, {w}×{h}）")
+        log(f"截图宽高比: {ar}（.env 指定, 实际像素 {w}×{h} 为 {actual_ar}）")
     else:
-        ar = detect_aspect_ratio(w, h)
+        ar = actual_ar
         log(f"截图宽高比: {ar}（自动检测, {w}×{h}）")
 
     crop = CROP_PROFILES.get(ar)
@@ -196,19 +196,22 @@ def crop_map_from_screenshot(img):
         else:
             log(f"未知宽高比 {ar}，回退到 16:9", "WARN")
         crop = CROP_PROFILES["16:9"]
+        ar = "16:9"
 
     l, t, r, b = crop
     cropped = img[int(h * t):int(h * b), int(w * l):int(w * r)]
     log(f"裁剪: ({int(w*l)},{int(h*t)})-({int(w*r)},{int(h*b)}) -> {cropped.shape[1]}×{cropped.shape[0]}")
 
-    # 正方化校正：地图区域始终为正方形，裁剪后若不是正方形则 resize
-    if SQUARE_CORRECTION.get(ar, False):
+    # 拉伸模式校正：实际像素比例与配置不一致时，说明是拉伸模式，需要正方化
+    # 例如：实际像素 16:9 但配置 16:10（拉伸显示器）
+    is_stretched = (ASPECT_RATIO != "auto" and actual_ar != ar)
+    if is_stretched:
         ch, cw = cropped.shape[:2]
         if abs(cw - ch) > 5:
             side = max(cw, ch)
             cropped = cv2.resize(cropped, (side, side),
                                  interpolation=cv2.INTER_AREA if side < max(cw, ch) else cv2.INTER_CUBIC)
-            log(f"正方化校正 ({ar}): {cw}×{ch} -> {side}×{side}")
+            log(f"拉伸模式校正: {cw}×{ch} -> {side}×{side} (实际{actual_ar}→配置{ar})")
 
     return cropped
 
